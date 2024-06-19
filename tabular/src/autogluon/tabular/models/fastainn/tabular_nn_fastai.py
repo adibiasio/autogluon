@@ -209,7 +209,7 @@ class NNFastAiTabularModel(AbstractModel):
             df = df.copy()
         return df
 
-    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, num_cpus=None, num_gpus=0, sample_weight=None, **kwargs):
+    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, num_cpus=None, num_gpus=0, sample_weight=None, generate_curves=False, **kwargs):
         try_import_fastai()
         import torch
         from fastai import torch_core
@@ -280,6 +280,20 @@ class NNFastAiTabularModel(AbstractModel):
             else np.greater
         )
 
+        metrics = nn_metric
+        recorder = None
+        if generate_curves:
+            from fastai.learner import Recorder
+            recorder = Recorder(train_metrics=True)
+            metrics = []
+            metric_map = self.__get_metrics_map()
+            metric_names = ["accuracy"] # "precision", "recall", "f1"
+            for name in metric_names:
+                if name in metric_map:
+                    metrics.append(metric_map[name])
+                else:
+                    metric_names.remove(name)
+
         # TODO: calculate max emb concat layer size and use 1st layer as that value and 2nd in between number of classes and the value
         if params.get("layers", None) is not None:
             layers = params["layers"]
@@ -314,9 +328,10 @@ class NNFastAiTabularModel(AbstractModel):
         self.model = tabular_learner(
             dls,
             layers=layers,
-            metrics=nn_metric,
+            metrics=metrics,
             config=tabular_config(ps=params["ps"], embed_p=params["emb_drop"]),
             loss_func=loss_func,
+            cbs=recorder,
         )
         logger.log(15, self.model.model)
 
@@ -357,6 +372,27 @@ class NNFastAiTabularModel(AbstractModel):
                         raise TimeLimitExceeded
 
                     self.model.fit_one_cycle(epochs, params["lr"], cbs=callbacks)
+
+                    # recorder.values = [
+                    #     [train_loss, train_metric_1, train_metric_2, ..., validation_loss, validation_metric_1, validation_metric_2, ...] # epoch 0
+                    #     [train_loss, train_metric_1, train_metric_2, ..., validation_loss, validation_metric_1, validation_metric_2, ...] # epoch 1
+                    #     ...
+                    # ]
+
+                    if generate_curves:
+                        epochs_trained = len(recorder.values)
+                        metric_names = ["loss"] + metric_names
+
+                        train_curves = { metric : [] for metric in metric_names }
+                        val_curves = { metric : [] for metric in metric_names }
+                        curves = [train_curves, val_curves]
+
+                        for epoch_trained in range(epochs_trained):
+                            for i, curve in enumerate(curves):
+                                for j, metric in enumerate(metric_names):
+                                    curve[metric].append(recorder.values[epoch_trained][len(metric_names) * i + j])
+
+                        self.save_curves(metric_names, train_curves, val_curves)
 
                     # Load the best one and export it
                     self.model = self.model.load(fname)

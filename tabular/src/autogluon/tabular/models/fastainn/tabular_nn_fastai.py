@@ -209,7 +209,7 @@ class NNFastAiTabularModel(AbstractModel):
             df = df.copy()
         return df
 
-    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, num_cpus=None, num_gpus=0, sample_weight=None, generate_curves=False, **kwargs):
+    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, num_cpus=None, num_gpus=0, sample_weight=None, generate_curves=True, **kwargs):
         try_import_fastai()
         import torch
         from fastai import torch_core

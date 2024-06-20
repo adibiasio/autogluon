@@ -791,7 +791,7 @@ class AbstractModel:
         assert self.is_initialized(), "Model must be initialized before calling self._get_child_aux_val!"
         return self.params_aux.get(key, default)
 
-    def fit(self, **kwargs):
+    def fit(self, **kwargs): # TODO: add generate_curves flag and X_test / y_test HERE (also ensure that these are only valid for ITERATIVE LEARNERS)
         """
         Fit model to predict values in y based on X.
 
@@ -1099,7 +1099,7 @@ class AbstractModel:
         return path
 
 
-    def save_curves(self, metrics, train_curves, val_curves, path: str = None):
+    def save_curves(self, metrics, train_curves, val_curves, test_curves=None, path: str = None):
         """
         Saves learning curves to disk.
 
@@ -1111,6 +1111,8 @@ class AbstractModel:
             Dictionary of evaluation metrics computed at each iteration on the training dataset
         validation_curve : dict(str : list(float))
             Dictionary of evaluation metrics computed at each iteration on the validation dataset
+        test_curves : dict(str : list(float)), default None
+            Dictionary of evaluation metrics computed at each iteration on the test dataset
 
         e.g.
                 {
@@ -1136,7 +1138,7 @@ class AbstractModel:
         os.makedirs(path, exist_ok=True)
         file_path = os.path.join(path, f"curves.json")
 
-        curves = [
+        curve_data = [
             metrics,
             [
                 # iteration data goes here
@@ -1148,18 +1150,17 @@ class AbstractModel:
             iterations = len(train_curves[metrics[0]])
 
         for i in range(iterations):
-            curves[1].append([])
+            curve_data[1].append([])
             for metric in metrics:
-                curves[1][i].append([
-                        train_curves[metric][i], # "train": 
-                        val_curves[metric][i], # "val": 
-                        # "test": test_curves[metric][i], # TODO: implement test curve data
-                    ])
+                curr_metrics = [train_curves[metric][i], val_curves[metric][i]]
+                if test_curves:
+                    curr_metrics.append(test_curves[metric][i])
+                curve_data[1][i].append([curr_metrics])
 
         with open(file_path, 'w') as json_file:
-            json.dump(curves, json_file, indent=4)
+            json.dump(curve_data, json_file, indent=4)
 
-        return curves
+        return curve_data
 
 
 

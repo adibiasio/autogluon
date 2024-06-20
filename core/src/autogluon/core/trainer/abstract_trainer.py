@@ -1841,7 +1841,7 @@ class AbstractTrainer:
         Trains model but does not add the trained model to this Trainer.
         Returns trained model object.
         """
-        model = model.fit(X=X, y=y, X_val=X_val, y_val=y_val, total_resources=total_resources, **model_fit_kwargs)
+        model = model.fit(X=X, y=y, X_val=X_val, y_val=y_val, total_resources=total_resources, **model_fit_kwargs) # TODO: add generate_curves flag and X_test / y_test HERE
         return model
 
     def _train_and_save(
@@ -1901,7 +1901,7 @@ class AbstractTrainer:
                         logger.log(15, f"Dropping pseudo in stacking layer due to missing out-of-fold predictions")
                     model_fit_kwargs.pop("X_pseudo", None)
                     model_fit_kwargs.pop("y_pseudo", None)
-                model = self._train_single(X, y, model, X_val, y_val, total_resources=total_resources, **model_fit_kwargs)
+                model = self._train_single(X, y, model, X_val, y_val, total_resources=total_resources, **model_fit_kwargs) # TODO: add generate_curves flag and X_test / y_test HERE
 
             fit_end_time = time.time()
             if self.weight_evaluation:

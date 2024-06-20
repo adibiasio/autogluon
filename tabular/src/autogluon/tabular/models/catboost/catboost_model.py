@@ -90,7 +90,7 @@ class CatBoostModel(AbstractModel):
 
     # TODO: Use Pool in preprocess, optimize bagging to do Pool.split() to avoid re-computing pool for each fold! Requires stateful + y
     #  Pool is much more memory efficient, avoids copying data twice in memory
-    def _fit(self, X, y, X_val=None, y_val=None, time_limit=None, num_gpus=0, num_cpus=-1, sample_weight=None, sample_weight_val=None, generate_curves=False, **kwargs):
+    def _fit(self, X, y, X_val=None, y_val=None, X_test=True, y_test=None, time_limit=None, num_gpus=0, num_cpus=-1, sample_weight=None, sample_weight_val=None, generate_curves=True, **kwargs):
         time_start = time.time()
         try_import_catboost()
         from catboost import CatBoostClassifier, CatBoostRegressor, Pool
@@ -123,10 +123,22 @@ class CatBoostModel(AbstractModel):
         else:
             X_val = self.preprocess(X_val)
             X_val = Pool(data=X_val, label=y_val, cat_features=cat_features, weight=sample_weight_val)
-            eval_set = [X_val, X] # validation set MUST be listed FIRST before other datasets
+            eval_set = [X_val] # validation set MUST be listed FIRST before other datasets
             early_stopping_rounds = ag_params.get("early_stop", "adaptive")
             if isinstance(early_stopping_rounds, (str, tuple, list)):
                 early_stopping_rounds = self._get_early_stopping_rounds(num_rows_train=num_rows_train, strategy=early_stopping_rounds)
+
+            if generate_curves:
+                eval_set.append(X)
+                if X_test is not None:
+                    X_test = X_val
+                    # TODO: replace this with actual test data sets and sample_weight_test (need to figure out how to pass these down!)
+                    # X_test = self.preprocess(X_test)
+                    # X_test = Pool(data=X_test, label=y_test, cat_features=cat_features, weight=sample_weight_test)
+                    eval_set.append(X_test)
+            
+        
+        # y_test.values = 0
 
         if params.get("allow_writing_files", False):
             if "train_dir" not in params:
@@ -243,7 +255,13 @@ class CatBoostModel(AbstractModel):
             metrics = [params["eval_metric"]] + params["custom_metric"]
             train_curves = eval_results["validation_1"]
             val_curves = eval_results['validation_0']
-            self.save_curves(metrics, train_curves, val_curves)
+
+            params = {}
+            if X_test:
+                test_curves = eval_results['validation_2']
+                params["test_curves"] = test_curves
+
+            self.save_curves(metrics, train_curves, val_curves, **params)
 
         self.params_trained["iterations"] = self.model.tree_count_
 

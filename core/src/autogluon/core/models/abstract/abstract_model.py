@@ -2104,6 +2104,16 @@ class AbstractModel:
 
         Possible params:
 
+        generate_curves : bool
+            boolean flag determining if learning curves should be saved to disk for iterative learners.
+        
+        curve_metrics : list(...)
+            list of metrics to be evaluated at each iteration of the learning curves 
+            (only used if generate_curves is True)
+
+        use_error_for_curve_metrics : bool
+            boolean flag determining if learning curve metrics should be displayed in error format (see Scorer class)
+        
         early_stop : int, str, or tuple
             generic name for early stopping logic. Typically can be an int or a str preset/strategy.
             Also possible to pass tuple of (class, kwargs) to construct a custom early stopping object.

@@ -918,7 +918,12 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
                 (which may improve metrics like log_loss) and will train a scalar parameter on the validation set.
                 If True and the problem_type is quantile regression, conformalization will be used to calibrate the Predictor's estimated quantiles
                 (which may improve the prediction interval coverage, and bagging could further improve it) and will compute a set of scalar parameters on the validation set.
-
+        test_data : str or :class:`TabularDataset` or :class:`pd.DataFrame`
+            Table of the test data, which is similar to a pandas DataFrame.
+            If str is passed, `train_data` will be loaded using the str value as the file path.
+            This test_data is never seen by the model during training and, if specified, is only used for logging purposes (i.e. for learning curve generation).
+            This test_data should be treated the same way test data is used in predictor.leaderboard.
+            
         Returns
         -------
         :class:`TabularPredictor` object. Returns self.
@@ -1005,6 +1010,7 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
         excluded_model_types = kwargs["excluded_model_types"]
         use_bag_holdout = kwargs["use_bag_holdout"]
         ds_args: dict = kwargs["ds_args"]
+        test_data = kwargs["test_data"]
 
         if ag_args is None:
             ag_args = {}
@@ -1016,6 +1022,7 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
 
         train_data, tuning_data, unlabeled_data = self._validate_fit_data(train_data=train_data, tuning_data=tuning_data, unlabeled_data=unlabeled_data)
         infer_limit, infer_limit_batch_size = self._validate_infer_limit(infer_limit=infer_limit, infer_limit_batch_size=infer_limit_batch_size)
+        test_data = self._get_dataset(test_data, allow_nan=True)
 
         if hyperparameters is None:
             hyperparameters = "default"
@@ -1132,6 +1139,7 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             infer_limit_batch_size=infer_limit_batch_size,
             verbosity=verbosity,
             use_bag_holdout=use_bag_holdout,
+            test_data = test_data,
         )
         ag_post_fit_kwargs = dict(
             keep_only_best=kwargs["keep_only_best"],
@@ -4567,6 +4575,8 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             # pseudo label
             pseudo_data=None,
             name_suffix=None,
+            # test data (for logging purposes)
+            test_data=None,
         )
 
     @staticmethod

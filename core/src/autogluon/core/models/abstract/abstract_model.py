@@ -854,6 +854,7 @@ class AbstractModel:
         self._register_fit_metadata(**kwargs)
         self.validate_fit_resources(**kwargs)
         self._validate_fit_memory_usage(**kwargs)
+        # X_test, y_test = val.clone etc.
         out = self._fit(**kwargs)
         if out is None:
             out = self

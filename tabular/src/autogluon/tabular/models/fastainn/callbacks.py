@@ -9,6 +9,18 @@ from fastcore.basics import store_attr
 logger = logging.getLogger(__name__)
 
 
+class TestSetRecorder(Callback):
+    def __init__(self, ds_idx=2, **kwargs):
+        self.values = []
+        self.ds_idx = ds_idx
+    
+    def after_epoch(self):
+        old_log = self.recorder.log.copy()
+        self.learn._do_epoch_validate(ds_idx=self.ds_idx, dl=None)
+        self.values.append(self.recorder.log[len(old_log):])
+        self.recorder.log = old_log
+
+
 class BatchTimeTracker(Callback):
     """
     Training callback which allows collecting batch training times. The primary use is epoch training time estimation in adaptive epoch number selection.

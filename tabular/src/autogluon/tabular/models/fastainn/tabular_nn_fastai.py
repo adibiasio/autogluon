@@ -30,6 +30,7 @@ from autogluon.common.utils.resource_utils import ResourceManager
 from autogluon.common.utils.try_import import try_import_fastai
 from autogluon.core.constants import BINARY, QUANTILE, REGRESSION
 from autogluon.core.hpo.constants import RAY_BACKEND
+from autogluon.core.metrics import get_metric
 from autogluon.core.models import AbstractModel
 from autogluon.core.utils.exceptions import TimeLimitExceeded
 from autogluon.core.utils.files import make_temp_directory
@@ -216,6 +217,7 @@ class NNFastAiTabularModel(AbstractModel):
         from fastai.tabular.learner import tabular_learner
         from fastai.tabular.model import tabular_config
 
+        from .fastai_helpers import func_generator
         from .callbacks import AgSaveModelCallback, EarlyStoppingCallbackWithTimeLimit
         from .quantile_helpers import HuberPinballLoss
 
@@ -225,7 +227,16 @@ class NNFastAiTabularModel(AbstractModel):
             logger.log(15, "sample_weight not yet supported for NNFastAiTabularModel, this model will ignore them in training.")
 
         params = self._get_model_params()
+        ag_params = self._get_ag_params()
         self._num_cpus_infer = params.pop("_num_cpus_infer", 1)
+        generate_curves = ag_params.get("generate_curves", False)
+
+        if generate_curves:
+            X_test = kwargs.get("X_test", None)
+            y_test = kwargs.get("y_test", None)
+        else:
+            X_test = None
+            y_test = None
 
         self.y_scaler = params.get("y_scaler", None)
         if self.y_scaler is None:
@@ -264,8 +275,10 @@ class NNFastAiTabularModel(AbstractModel):
         logger.log(15, f"Fitting Neural Network with parameters {params}...")
         data = self._preprocess_train(X, y, X_val, y_val)
 
+        # switch these to if generate_curves: nn = stopping_metric & obfnname = nn.name & obj to monitor = nn.name
+
         nn_metric, objective_func_name = self.__get_objective_func_name(self.stopping_metric)
-        objective_func_name_to_monitor = self.__get_objective_func_to_monitor(objective_func_name)
+        objective_func_name_to_monitor = self.__get_objective_func_to_monitor(objective_func_name, generate_curves=generate_curves)
         objective_optim_mode = (
             np.less
             if objective_func_name
@@ -279,6 +292,55 @@ class NNFastAiTabularModel(AbstractModel):
             ]
             else np.greater
         )
+
+        eval_metrics = nn_metric
+        recorder = None
+        if generate_curves:
+            from fastai.learner import Recorder
+
+            recorder = Recorder(train_metrics=True) # Note: train_metrics=True, changes metric names in recorder
+            metric_names = list(set(ag_params.get("curve_metrics", [])))
+            use_curve_metric_error = ag_params.get("use_error_for_curve_metrics", True)
+
+            # FIXME: fastai currently only works with one custom metric, expand to more
+            # CURRENTLY, default to only generating objective function
+            metric_names = []
+
+            if self._get_default_fastai_loss_metrics() in metric_names:
+                metric_names.remove(self._get_default_fastai_loss_metrics())
+            scorers = [get_metric(name, self.problem_type, "eval_metric") for name in metric_names]
+
+            eval_metrics = [
+                func_generator(scorer, problem_type=self.problem_type, error=use_curve_metric_error)
+                for scorer in scorers
+            ]
+
+            # include objective func metric if not included already
+            if objective_func_name not in metric_names:
+                metric_names.append(objective_func_name)
+                eval_metrics.append(func_generator(
+                    metric=get_metric(objective_func_name, self.problem_type, "eval_metric"),
+                    problem_type=self.problem_type,
+                    error=use_curve_metric_error
+                ))
+
+            # from fastai.metrics import FBeta, Precision, R2Score, Recall, RocAucBinary, accuracy, mae, mse, rmse
+            # eval_metrics = [accuracy]
+            # eval_metrics = []
+            # for name in metric_names:
+                # metric, scorer_name = self.__get_objective_func_name(get_metric(name, self.problem_type, "eval_metric"))
+                # if metric is not None and metric not in eval_metrics and scorer_name != self._get_default_fastai_loss_metrics():
+                #     eval_metrics.append((metric, scorer_name))
+            
+            # if eval_metrics:
+            #     eval_metrics, metric_names = [list(l) for l in zip(*eval_metrics)]
+            # else:
+            #     metric_names = []
+
+            # # include objective func metric if not specified already
+            # if nn_metric is not None and objective_func_name not in metric_names:
+            #     metric_names.append(objective_func_name)
+            #     eval_metrics.append(nn_metric)
 
         # TODO: calculate max emb concat layer size and use 1st layer as that value and 2nd in between number of classes and the value
         if params.get("layers", None) is not None:
@@ -314,9 +376,10 @@ class NNFastAiTabularModel(AbstractModel):
         self.model = tabular_learner(
             dls,
             layers=layers,
-            metrics=nn_metric,
+            metrics=eval_metrics,
             config=tabular_config(ps=params["ps"], embed_p=params["emb_drop"]),
             loss_func=loss_func,
+            cbs=recorder,
         )
         logger.log(15, self.model.model)
 
@@ -357,6 +420,33 @@ class NNFastAiTabularModel(AbstractModel):
                         raise TimeLimitExceeded
 
                     self.model.fit_one_cycle(epochs, params["lr"], cbs=callbacks)
+
+                    # recorder.values = [
+                    #     If recorder.train_metrics = False:
+                    #     [train_loss, valid_loss, metric_1, metric_2, ...] # epoch 0
+                    # 
+                    #     If recorder.train_metrics = True:
+                    #     [train_loss, train_metric_1, train_metric_2, ..., valid_loss, valid_metric_1, valid_metric_2, ...] # epoch 0
+                    #     [train_loss, train_metric_1, train_metric_2, ..., valid_loss, valid_metric_1, valid_metric_2, ...] # epoch 1
+                    #     ...
+                    # ]
+
+                    # https://forums.fast.ai/t/how-to-specify-test-set-in-datablock/67812/12
+                    if generate_curves:
+                        epochs_trained = len(recorder.values)
+                        metric_names = [self._get_default_fastai_loss_metrics()] + metric_names
+
+                        # curves = [train, val, test]
+                        curves = [{ metric : [] for metric in metric_names }]
+                        curves += [{ metric : [] for metric in metric_names }]
+                        # curves += [{ metric : [] for metric in metric_names }] if X_test else []
+
+                        for epoch_trained in range(epochs_trained):
+                            for i, curve in enumerate(curves):
+                                for j, metric in enumerate(metric_names):
+                                    curve[metric].append(recorder.values[epoch_trained][len(metric_names) * i + j])
+
+                        self.save_curves(metric_names, *curves)
 
                     # Load the best one and export it
                     self.model = self.model.load(fname)
@@ -442,27 +532,46 @@ class NNFastAiTabularModel(AbstractModel):
             val_idx = np.arange(len(X_val)) + len(X)
         return df_train, train_idx, val_idx
 
-    def __get_objective_func_name(self, stopping_metric):
+    def _get_default_fastai_loss_metrics(self):
+        if self.problem_type == REGRESSION:
+            return "mean_squared_error"
+        elif self.problem_type == QUANTILE:
+            return "pinball_loss"
+        else:
+            return "log_loss"
+
+    def __get_objective_func_name(self, stopping_metric, generate_curves=False, use_error=True):
         metrics_map = self.__get_metrics_map()
 
         # Unsupported metrics will be replaced by defaults for a given problem type
+        # TODO: change this to creating a custom metric instead
         objective_func_name = stopping_metric.name
+
+        # from .fastai_helpers import func_generator
+        # if generate_curves:
+        #     nn_metric = func_generator(
+        #         metric = get_metric(objective_func_name, self.problem_type, "eval_metric"),
+        #         problem_type=self.problem_type,
+        #         error=use_error
+        #     )
+
+        #     return nn_metric, objective_func_name
+
         if objective_func_name not in metrics_map.keys():
-            if self.problem_type == REGRESSION:
-                objective_func_name = "mean_squared_error"
-            elif self.problem_type == QUANTILE:
-                objective_func_name = "pinball_loss"
-            else:
-                objective_func_name = "log_loss"
+            objective_func_name = self._get_default_fastai_loss_metrics()
             logger.warning(f"Metric {stopping_metric.name} is not supported by this model - using {objective_func_name} instead")
 
         nn_metric = metrics_map.get(objective_func_name, None)
 
         return nn_metric, objective_func_name
 
-    def __get_objective_func_to_monitor(self, objective_func_name):
+    def __get_objective_func_to_monitor(self, objective_func_name, generate_curves=False):
+        if generate_curves:
+            return f"valid_{objective_func_name}"
+
+        prefix = "valid_" if generate_curves else ""
         monitor_obj_func = {
-            **{k: m.name if hasattr(m, "name") else m.__name__ for k, m in self.__get_metrics_map().items() if m is not None},
+            **{k: f"{prefix}{m.name}" if hasattr(m, "name") else f"{prefix}{m.__name__}" for k, m in self.__get_metrics_map().items() if m is not None},
             "log_loss": "valid_loss",
         }
         objective_func_name_to_monitor = objective_func_name
@@ -551,6 +660,9 @@ class NNFastAiTabularModel(AbstractModel):
         default_params = get_param_baseline(self.problem_type)
         for param, val in default_params.items():
             self._set_default_param_value(param, val)
+
+    def _ag_params(self) -> set:
+        return {"early_stop", "generate_curves", "curve_metrics", "use_error_for_curve_metrics"}
 
     def _get_default_searchspace(self):
         return get_default_searchspace(self.problem_type, num_classes=None)

@@ -3,7 +3,7 @@ import time
 
 from autogluon.common.utils.resource_utils import ResourceManager
 
-from .catboost_utils import CATBOOST_QUANTILE_PREFIX
+from .catboost_utils import func_generator, CATBOOST_QUANTILE_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,11 @@ class EarlyStoppingCallback:
 
     def after_iteration(self, info):
         is_best_iter = False
+        # when calculating metrics for multiple "validation" datasets in CatBoost, validation is not
+        # a valid key, validation keys are named validation_0, validation_1, ...
+        if self.compare_key not in info.metrics:
+            self.compare_key = "validation_0"
+
         if self.is_quantile:
             # FIXME: CatBoost adds extra ',' in the metric name if quantile levels are not balanced
             # e.g., 'MultiQuantile:alpha=0.1,0.25,0.5,0.95' becomes 'MultiQuantile:alpha=0.1,,0.25,0.5,0.95'
@@ -164,3 +169,32 @@ class EarlyStoppingCallback:
 
         should_stop = self.es.update(cur_round=info.iteration, is_best=is_best_iter)
         return not should_stop
+
+
+# class CustomMetricCallback:
+#     """
+#     NOTE: This class is non-operational
+#     """
+#     def __init__(self, model, scorers, eval_sets, problem_type, use_error=True):
+#         self.model = model
+#         self.metrics = [func_generator(scorer, problem_type=problem_type, error=use_error) for scorer in scorers]
+#         self.eval_sets = eval_sets
+#         # self.eval_sets = [ the pools (i.e. X and X_val) for eval_set in eval_sets]
+#         pass
+
+#     def after_iteration(self, info):
+#         """
+#         ISSUE: no access to the model or internal state here, so cannot call predict() to get prediction probabilities
+#         and evaluate additional sets using scorer methods.
+#         """
+#         curves = info.metrics
+
+#         for eval_set in self.eval_sets:
+#             y_true = eval_set.get_label()
+#             y_pred = self.model.predict(eval_set)
+#             # _catboost.CatBoostError: There is no trained model to use predict(). Use fit() to train model. Then use this method.
+
+#             pass
+
+#         return False
+    

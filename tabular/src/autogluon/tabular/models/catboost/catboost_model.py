@@ -14,9 +14,10 @@ from autogluon.core.constants import MULTICLASS, PROBLEM_TYPES_CLASSIFICATION, Q
 from autogluon.core.models import AbstractModel
 from autogluon.core.models._utils import get_early_stopping_rounds
 from autogluon.core.utils.exceptions import TimeLimitExceeded
+from autogluon.core.metrics import get_metric
 
 from .callbacks import EarlyStoppingCallback, MemoryCheckCallback, TimeCheckCallback
-from .catboost_utils import get_catboost_metric_from_ag_metric
+from .catboost_utils import get_catboost_metric_from_ag_metric, func_generator
 from .hyperparameters.parameters import get_param_baseline
 from .hyperparameters.searchspaces import get_default_searchspace
 
@@ -97,6 +98,15 @@ class CatBoostModel(AbstractModel):
 
         ag_params = self._get_ag_params()
         params = self._get_model_params()
+        generate_curves = ag_params.get("generate_curves", False)
+
+        if generate_curves:
+            X_test = kwargs.get("X_test", None)
+            y_test = kwargs.get("y_test", None)
+        else:
+            X_test = None
+            y_test = None
+
         params["thread_count"] = num_cpus
         if self.problem_type == SOFTCLASS:
             # FIXME: This is extremely slow due to unoptimized metric / objective sent to CatBoost
@@ -123,10 +133,36 @@ class CatBoostModel(AbstractModel):
         else:
             X_val = self.preprocess(X_val)
             X_val = Pool(data=X_val, label=y_val, cat_features=cat_features, weight=sample_weight_val)
-            eval_set = X_val
+            eval_set = [X_val] # validation set MUST be listed FIRST before other datasets
             early_stopping_rounds = ag_params.get("early_stop", "adaptive")
             if isinstance(early_stopping_rounds, (str, tuple, list)):
                 early_stopping_rounds = self._get_early_stopping_rounds(num_rows_train=num_rows_train, strategy=early_stopping_rounds)
+
+        if generate_curves:
+            metric_names = list(set(ag_params.get("curve_metrics", [])))
+
+            # FIXME: Only uses first metric because catboost does not support multiple custom metrics
+            metric_names = [metric_names[0]] if len(metric_names) > 0 else []
+
+            use_curve_metric_error = ag_params.get("use_error_for_curve_metrics", True)
+            scorers = [get_metric(name, self.problem_type, "eval_metric") for name in metric_names]
+            eval_set += [X]
+
+            if X_test is not None:
+                X_test = self.preprocess(X_test)
+                X_test = Pool(data=X_test, label=y_test, cat_features=cat_features, weight=None)
+                eval_set += [X_test]
+
+            from .catboost_utils import func_generator
+            custom_metrics = [
+                func_generator(
+                    metric=scorer,
+                    problem_type=self.problem_type,
+                    error=use_curve_metric_error
+                )      
+                for scorer in scorers
+                ]
+            params["custom_metric"] = custom_metrics
 
         if params.get("allow_writing_files", False):
             if "train_dir" not in params:
@@ -217,6 +253,9 @@ class CatBoostModel(AbstractModel):
                     extra_fit_kwargs["early_stopping_rounds"] = 50
         self.model = model_type(**params)
 
+        # if generate_curves:
+        #     callbacks.append(CustomMetricCallback(self.model, scorers, eval_set, self.problem_type, use_error=use_curve_metric_error))
+
         # TODO: Custom metrics don't seem to work anymore
         # TODO: Custom metrics not supported in GPU mode
         # TODO: Callbacks not supported in GPU mode
@@ -230,6 +269,24 @@ class CatBoostModel(AbstractModel):
             fit_final_kwargs["use_best_model"] = True
 
         self.model.fit(X, **fit_final_kwargs)
+
+        train_curve = []
+        val_curve = []
+
+        for preds_train, preds_valid, preds_test in zip(self.model.staged_predict(X), self.model.staged_predict(X_val), self.model.staged_predict(X_test)):
+            train_curve.append(scorers[0](y, preds_train))
+            val_curve.append(scorers[0](y_val, preds_valid))
+            val_curve.append(scorers[0](y_test, preds_valid))
+
+        if generate_curves:
+            def filter(d, keys):
+                return {key: d[key] for key in keys if key in d}
+            
+            eval_results = self.model.get_evals_result()
+            # metrics = [params["eval_metric"]] + params["custom_metric"]
+            # train_curves = eval_results["validation_1"]
+            # val_curves = eval_results['validation_0']
+            # self.save_curves(metrics, train_curves, val_curves)
 
         self.params_trained["iterations"] = self.model.tree_count_
 
@@ -304,7 +361,7 @@ class CatBoostModel(AbstractModel):
         return get_early_stopping_rounds(num_rows_train=num_rows_train, strategy=strategy)
 
     def _ag_params(self) -> set:
-        return {"early_stop"}
+        return {"early_stop", "generate_curves", "curve_metrics", "use_error_for_curve_metrics"}
 
     def _validate_fit_memory_usage(self, mem_error_threshold: float = 1, mem_warning_threshold: float = 0.75, mem_size_threshold: int = 1e9, **kwargs):
         return super()._validate_fit_memory_usage(

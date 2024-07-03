@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 
 from autogluon.core.constants import BINARY, MULTICLASS, QUANTILE, REGRESSION, SOFTCLASS
 
@@ -7,14 +8,33 @@ logger = logging.getLogger(__name__)
 
 CATBOOST_QUANTILE_PREFIX = "MultiQuantile:"
 
+# User defined Metrics:
+# https://github.com/catboost/catboost/blob/24aceedd3abf0ddb2f4791d4b8e054deb6de916f/catboost/tutorials/custom_loss/custom_loss_and_metric_tutorial.ipynb
+
 
 # TODO: Add weight support?
 # TODO: Can these be optimized? What computational cost do they have compared to the default catboost versions?
 class CustomMetric:
-    def __init__(self, metric, is_higher_better, needs_pred_proba):
-        self.metric = metric
-        self.is_higher_better = is_higher_better
-        self.needs_pred_proba = needs_pred_proba
+    """Calculating custom metrics.
+
+    Helpful CatBoost tutorial notebook for reference:
+    https://github.com/catboost/catboost/blob/24aceedd3abf0ddb2f4791d4b8e054deb6de916f/catboost/tutorials/custom_loss/custom_loss_and_metric_tutorial.ipynb
+
+    Parameters
+    ----------
+    scorer : Scorer
+       A metric, represented as a scorer object, to be computed.
+    """
+    def __init__(self, scorer, wrapper=None):
+        self.metric = scorer
+        self.name = self.metric.name
+        self.is_higher_better = self.metric.greater_is_better
+        self.needs_pred_proba = not self.metric.needs_pred
+
+        if not wrapper:
+            wrapper = self.metric
+
+        self.wrapper = wrapper
 
     @staticmethod
     def get_final_error(error, weight):
@@ -24,7 +44,61 @@ class CustomMetric:
         return self.is_higher_better
 
     def evaluate(self, approxes, target, weight):
-        raise NotImplementedError
+        return self.wrapper(approxes, target, weight)
+
+
+def func_generator(metric, problem_type: str, error=False):
+    """Create a custom metric compatible with Catboost"""
+    needs_pred_proba = not metric.needs_pred
+    compute = (metric.error if error else metric)
+
+    if needs_pred_proba:
+
+        def custom_wrapper(approxes, target, weight):
+            assert len(approxes) == 1
+            assert len(target) == len(approxes[0])
+            approx = approxes[0]
+            proba = np.asarray([np.exp(a) / (1 + np.exp(a)) for a in approx], dtype=np.float32)
+            y_true = target
+            return compute(y_true, proba), 0
+
+    else:
+
+        if problem_type in [MULTICLASS, SOFTCLASS]:
+
+            def custom_wrapper(approxes, target, weight):
+                assert len(approxes) == 1
+                assert len(target) == len(approxes[0])
+                approx = approxes[0]
+                proba = np.asarray([np.exp(a) / (1 + np.exp(a)) for a in approx], dtype=np.float32)
+                y_true = target
+                y_hat = proba.argmax(axis=1)
+                return compute(y_true, y_hat), 0
+
+        elif problem_type == BINARY:
+
+            def custom_wrapper(approxes, target, weight):
+                assert len(approxes) == 1
+                assert len(target) == len(approxes[0])
+                approx = approxes[0]
+                proba = np.asarray([np.exp(a) / (1 + np.exp(a)) for a in approx], dtype=np.float32)
+                y_true = target
+                y_hat = np.round(proba)
+                return compute(y_true, y_hat), 0
+
+        else:
+
+            def custom_wrapper(approxes, target, weight):
+                assert len(approxes) == 1
+                assert len(target) == len(approxes[0])
+                approx = approxes[0]
+                proba = np.asarray([np.exp(a) / (1 + np.exp(a)) for a in approx], dtype=np.float32)
+                y_true = target
+                return compute(y_true, proba), 0
+
+    custom_metric = CustomMetric(metric, wrapper=custom_wrapper)
+    custom_metric.__name__ = metric.name
+    return custom_metric
 
 
 def get_catboost_metric_from_ag_metric(metric, problem_type, quantile_levels=None):

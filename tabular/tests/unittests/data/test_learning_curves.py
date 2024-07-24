@@ -3,6 +3,9 @@ from autogluon.core.metrics import METRICS, get_metric
 from autogluon.core.constants import BINARY, REGRESSION, MULTICLASS
 from autogluon.core.constants import DEFAULT_LEARNING_CURVE_METRICS, LEARNING_CURVE_SUPPORTED_MODELS, LEARNING_CURVE_SUPPORTED_PROBLEM_TYPES
 
+# add tests to ensure correctness of learning curve metrics 
+# (compare final evaluation metrics generated with / without final lc flag to ensure that they are the same)
+# learning curve format changed, update these tests
 
 def get_one_model_problem():
     problem_type = LEARNING_CURVE_SUPPORTED_PROBLEM_TYPES[0]

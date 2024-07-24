@@ -196,7 +196,7 @@ class XGBoostModel(AbstractModel):
         # bst.set_param({"predictor": "gpu_predictor"})
 
         if eval_set is not None:
-            self.params_trained["n_estimators"] = bst.best_iteration + 1
+            self.params_trained["n_estimators"] = self.model.n_estimators # bst.best_iteration + 1
         # Don't save the callback or eval_metric objects
         self.model.set_params(callbacks=None, eval_metric=None)
 

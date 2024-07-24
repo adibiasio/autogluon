@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import networkx as nx
 import numpy as np
 import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 from packaging import version
 
 from autogluon.common.loaders import load_json
@@ -2596,6 +2598,28 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
 
         metadata = self.info()
         path = os.path.join(metadata["path"], "models")
+
+        metadata = {
+            "problem_type": metadata["problem_type"],
+            "eval_metric": metadata["eval_metric"],
+            "num_classes": metadata["num_classes"],
+            "num_rows_train": metadata["num_rows_train"],
+            "num_rows_val": metadata["num_rows_val"],
+            "num_rows_test": metadata["num_rows_test"],
+            "models": [
+                {
+                    "model_type": info["model_type"],
+                    "stopping_metric": info["stopping_metric"],
+                    "hyperparameters": info["hyperparameters"],
+                    "hyperparameters_fit": info["hyperparameters_fit"],
+                    "ag_args_fit": info["ag_args_fit"],
+                    "predict_time": info["predict_time"],
+                    "fit_time": info["fit_time"],
+                    "val_score": info["val_score"],
+                } for model, info in metadata["model_info"].items()
+            ]
+        }
+
         models = os.listdir(path)
         models = [name for name in models if MODEL_NAMES.get(name, None) in LEARNING_CURVE_SUPPORTED_MODELS]
 
@@ -2609,22 +2633,42 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
 
             model_data[MODEL_NAMES[model]] = load_json.load(file)
 
-            # Attempt to delete the file
-            try:
-                os.remove(file)
-            except PermissionError:
-                print(f"Error: Permission denied to delete '{file}'.")
-            except OSError as e:
-                print(f"Error: {e}")
-
-            self.verbosity
-
         aggregated_data = [
             metadata,
             model_data
         ]
 
         return aggregated_data
+
+    def plot_curves(self, model, metric, learning_curves : dict | None = None):
+        if learning_curves is None:
+            learning_curves = self.learning_curves()
+
+        curve = learning_curves[1][model][1]
+        metric_index = learning_curves[1][model][0].index(metric)
+        iterations = len(curve[metric_index][0]) + 1
+        names = ["train", "val", "test"][:len(curve[metric_index])]
+
+        data = pd.DataFrame({
+            "iterations": list(range(1, iterations)),
+            **{ name : curve[metric_index][i] for i, name in enumerate(names) },
+        })
+
+        data = data.melt(id_vars='iterations', var_name='Line', value_name='Y')
+
+        plt.ioff()
+        fig, ax = plt.subplots()
+
+        sns.lineplot(x='iterations', y='Y', hue='Line', data=data, ax=ax)
+
+        ax.set_title(f'Learning Curves for {model} using {metric} as Eval Metric')
+        ax.set_xlabel('iterations')
+        ax.set_ylabel(metric)
+        ax.legend()
+        ax.grid(True)
+        plt.ion()
+
+        return fig
 
     def model_failures(self, verbose: bool = False) -> pd.DataFrame:
         """

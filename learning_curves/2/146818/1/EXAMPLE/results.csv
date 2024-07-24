@@ -1,0 +1,2 @@
+dataset,fold,framework,test_error,val_error,eval_metric,test_score,val_score,time_fit,models_count,time_predict,tid,problem_type,repeat,sample
+Australian,1,EXAMPLE,0.09337860780984719,0.07065217391304357,roc_auc,0.9066213921901528,0.9293478260869564,28.24691343307495,3,0.011396408081054688,146818,binary,0,0

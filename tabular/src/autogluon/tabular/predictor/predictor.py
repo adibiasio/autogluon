@@ -46,7 +46,7 @@ from autogluon.core.constants import (
 )
 from autogluon.core.data.label_cleaner import LabelCleanerMulticlassToBinary
 from autogluon.core.dataset import TabularDataset
-from autogluon.core.metrics import Scorer
+from autogluon.core.metrics import Scorer, get_metric
 from autogluon.core.problem_type import problem_type_info
 from autogluon.core.pseudolabeling.pseudolabeling import filter_ensemble_pseudo, filter_pseudo
 from autogluon.core.scheduler.scheduler_factory import scheduler_factory
@@ -940,6 +940,21 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
                 (which may improve metrics like log_loss) and will train a scalar parameter on the validation set.
                 If True and the problem_type is quantile regression, conformalization will be used to calibrate the Predictor's estimated quantiles
                 (which may improve the prediction interval coverage, and bagging could further improve it) and will compute a set of scalar parameters on the validation set.
+            test_data : str or :class:`TabularDataset` or :class:`pd.DataFrame`, default = None
+                Table of the test data, which is similar to a pandas DataFrame.
+                If str is passed, `test_data` will be loaded using the str value as the file path.
+                NOTE: This test_data is NEVER SEEN by the model during training and, if specified, is only used for logging purposes (i.e. for learning curve generation).
+                This test_data should be treated the same way test data is used in predictor.leaderboard.
+            learning_curves : bool or dict, default = None
+                If bool and is True, default learning curve hyperparameter ag_args will be initialized for each of the models included in the ensemble.
+                    By default, learning curves will include eval_metric scores specified in fit call arguments. 
+                    This can be overwritten as shown below.
+                If dict, user can pass learning_curves parameters to be initialized as ag_args in the following format:
+                    learning_curves = {
+                        "metrics": str or list(str) or Scorer or list(Scorer): 
+                            autogluon metric scorer(s) to be calculated at each iteration, represented as Scorer object(s) or scorer name(s) (str)
+                        "use_error": bool : whether to use error or score format for metrics listed above
+                    }
 
         Returns
         -------
@@ -1030,6 +1045,8 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
         excluded_model_types = kwargs["excluded_model_types"]
         use_bag_holdout = kwargs["use_bag_holdout"]
         ds_args: dict = kwargs["ds_args"]
+        test_data = kwargs["test_data"]
+        learning_curves = kwargs["learning_curves"]
 
         if ag_args is None:
             ag_args = {}
@@ -1039,7 +1056,7 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
         if feature_generator_init_kwargs is None:
             feature_generator_init_kwargs = dict()
 
-        train_data, tuning_data, unlabeled_data = self._validate_fit_data(train_data=train_data, tuning_data=tuning_data, unlabeled_data=unlabeled_data)
+        train_data, tuning_data, test_data, unlabeled_data = self._validate_fit_data(train_data=train_data, tuning_data=tuning_data, test_data=test_data, unlabeled_data=unlabeled_data)
         infer_limit, infer_limit_batch_size = self._validate_infer_limit(infer_limit=infer_limit, infer_limit_batch_size=infer_limit_batch_size)
 
         if hyperparameters is None:
@@ -1062,6 +1079,14 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
         else:
             self._learner.validate_label(X=train_data)
             inferred_problem_type = self._learner.infer_problem_type(y=train_data[self.label], silent=True)
+
+        learning_curves = self._initialize_learning_curve_params(learning_curves=learning_curves, problem_type=inferred_problem_type)
+        if len(learning_curves) == 0:
+            test_data = None
+        if ag_args_fit is not None:
+            ag_args_fit.update(learning_curves)
+        else:
+            ag_args_fit = learning_curves
 
         num_bag_folds, num_bag_sets, num_stack_levels, dynamic_stacking, use_bag_holdout = self._sanitize_stack_args(
             num_bag_folds=num_bag_folds,
@@ -1145,6 +1170,7 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
         ag_fit_kwargs = dict(
             X=train_data,
             X_val=tuning_data,
+            X_test=test_data,
             X_unlabeled=unlabeled_data,
             holdout_frac=holdout_frac,
             num_bag_folds=num_bag_folds,
@@ -1262,7 +1288,7 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             if holdout_data is None:
                 ds_fit_kwargs.update(dict(holdout_frac=holdout_frac, ds_fit_context=os.path.join(ds_fit_context, "sub_fit_ho")))
             else:
-                _, holdout_data, _ = self._validate_fit_data(train_data=X, tuning_data=holdout_data)
+                _, holdout_data, _, _ = self._validate_fit_data(train_data=X, tuning_data=holdout_data)
                 ds_fit_kwargs["ds_fit_context"] = os.path.join(ds_fit_context, "sub_fit_custom_ho")
 
             stacked_overfitting = self._sub_fit_memory_save_wrapper(
@@ -2560,6 +2586,76 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             set_refit_score_to_parent=set_refit_score_to_parent,
             display=display,
         )
+
+    def learning_curves(self) -> Tuple[dict, dict]:
+        """
+        Retrieves learning curves generated during predictor.fit(). 
+        Will not work if the learning_curves flag was not set during training.
+        Note that learning curves are only generated for iterative learners with 
+        learning curve support.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        metadata: dict
+            A dictionary containing metadata related to the training process.
+
+        model_data: dict
+            A dictionary containing the learning curves across all models.
+            To see curve_data format, refer to AbstractModel's save_learning_curves() method.
+                {
+                    "model": curve_data,
+                    "model": curve_data,
+                    "model": curve_data,
+                    "model": curve_data,
+                }
+        """
+        metadata = self.info()
+        path = os.path.join(metadata["path"], "models")
+
+        def _valid_model(model: str):
+            model_type = self._trainer.get_model_attribute(model=model, attribute="type")
+            supports_learning_curves = model_type._get_class_tags().get("supports_learning_curves", False)
+            return supports_learning_curves
+
+        metadata = {
+            "problem_type": metadata["problem_type"],
+            "eval_metric": metadata["eval_metric"],
+            "num_classes": metadata["num_classes"],
+            "num_rows_train": metadata["num_rows_train"],
+            "num_rows_val": metadata["num_rows_val"],
+            "num_rows_test": metadata["num_rows_test"],
+            "models": {
+                model: {
+                    "model_name": info["name"],
+                    "model_type": info["model_type"],
+                    "stopping_metric": info["stopping_metric"],
+                    "hyperparameters": info["hyperparameters"],
+                    "hyperparameters_fit": info["hyperparameters_fit"],
+                    "ag_args_fit": info["ag_args_fit"],
+                    "predict_time": info["predict_time"],
+                    "fit_time": info["fit_time"],
+                    "val_score": info["val_score"],
+                } for model, info in metadata["model_info"].items()
+                if _valid_model(model=model)
+            }
+        }
+
+        model_data = {}
+        generated_models = os.listdir(path)
+        trained_models = self._trainer.get_model_names()
+        assert set(trained_models).issubset(generated_models)
+
+        models = trained_models
+        for model in models:
+            if _valid_model(model):
+                model_type = self._trainer.get_model_attribute(model=model, attribute="type")
+                model_data[model] = model_type.load_learning_curves(os.path.join(path, model))
+
+        return metadata, model_data
 
     def model_failures(self, verbose: bool = False) -> pd.DataFrame:
         """
@@ -4562,6 +4658,9 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             feature_generator="auto",
             unlabeled_data=None,
             _feature_generator_kwargs=None,
+            # learning curves and test data (for logging purposes only)
+            learning_curves=False,
+            test_data=None,
         )
         kwargs, ds_valid_keys = self._sanitize_dynamic_stacking_kwargs(kwargs)
         kwargs = self._validate_fit_extra_kwargs(kwargs, extra_valid_keys=list(fit_kwargs_default.keys()) + ds_valid_keys)
@@ -4766,12 +4865,15 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
         self,
         train_data: str | pd.DataFrame,
         tuning_data: str | pd.DataFrame | None = None,
+        test_data: str | pd.DataFrame | None = None,
         unlabeled_data: str | pd.DataFrame | None = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
         if isinstance(train_data, str):
             train_data = TabularDataset(train_data)
         if tuning_data is not None and isinstance(tuning_data, str):
             tuning_data = TabularDataset(tuning_data)
+        if test_data is not None and isinstance(test_data, str):
+            test_data = TabularDataset(test_data)
         if unlabeled_data is not None and isinstance(unlabeled_data, str):
             unlabeled_data = TabularDataset(unlabeled_data)
 
@@ -4782,44 +4884,116 @@ class TabularPredictor(TabularPredictorDeprecatedMixin):
             raise ValueError(
                 "Column names are not unique, please change duplicated column names (in pandas: train_data.rename(columns={'current_name':'new_name'})"
             )
-        if tuning_data is not None:
-            if not isinstance(tuning_data, pd.DataFrame):
-                raise AssertionError(f"tuning_data is required to be a pandas DataFrame, but was instead: {type(tuning_data)}")
-            self._validate_unique_indices(data=tuning_data, name="tuning_data")
+
+        self._validate_single_fit_dataset(train_data=train_data, other_data=tuning_data, name="tuning_data")
+        self._validate_single_fit_dataset(train_data=train_data, other_data=test_data, name="test_data")
+        self._validate_single_fit_dataset(train_data=train_data, other_data=unlabeled_data, name="unlabeled_data")
+
+        return train_data, tuning_data, test_data, unlabeled_data
+    
+    def _validate_single_fit_dataset(self, train_data: pd.DataFrame, other_data: pd.DataFrame, name: str):
+        """
+        Validates additional dataset, ensuring format is consistent with train dataset.
+
+        Parameters:
+        -----------
+        train_data : DataFrame
+            training set dataframe
+        other_data : DataFrame
+            additional data set
+        name : str
+            name of additional data set
+
+        Returns:
+        --------
+        None
+        """
+        if other_data is not None:
+            if not isinstance(other_data, pd.DataFrame):
+                raise AssertionError(f"{name} is required to be a pandas DataFrame, but was instead: {type(other_data)}")
+            self._validate_unique_indices(data=other_data, name=name)
             train_features = [column for column in train_data.columns if column != self.label]
-            tuning_features = [column for column in tuning_data.columns if column != self.label]
-            train_features, tuning_features = self._prune_data_features(train_features=train_features, other_features=tuning_features, is_labeled=True)
+            other_features = [column for column in other_data.columns if column != self.label]
+            train_features, other_features = self._prune_data_features(train_features=train_features, other_features=other_features, is_labeled=True)
             train_features = np.array(train_features)
-            tuning_features = np.array(tuning_features)
-            if np.any(train_features != tuning_features):
-                raise ValueError("Column names must match between training and tuning data")
+            other_features = np.array(other_features)
+            if np.any(train_features != other_features):
+                raise ValueError(f"Column names must match between train_data and {name}")
 
-            if self.label in tuning_data:
+            if self.label in other_data:
                 train_label_type = train_data[self.label].dtype
-                tuning_label_type = tuning_data[self.label].dtype
+                other_label_type = other_data[self.label].dtype
 
-                if train_label_type != tuning_label_type:
+                if train_label_type != other_label_type:
                     logger.warning(
-                        f"WARNING: train_data and tuning_data have mismatched label column dtypes! "
-                        f"train_label_type={train_label_type}, tuning_data_type={tuning_label_type}.\n"
+                        f"WARNING: train_data and {name} have mismatched label column dtypes! "
+                        f"train_label_type={train_label_type}, {name}_type={other_label_type}.\n"
                         f"\tYou should ensure the dtypes match to avoid bugs or instability.\n"
                         f"\tAutoGluon will attempt to convert the dtypes to align."
                     )
 
-        if unlabeled_data is not None:
-            if not isinstance(unlabeled_data, pd.DataFrame):
-                raise AssertionError(f"unlabeled_data is required to be a pandas DataFrame, but was instead: {type(unlabeled_data)}")
-            self._validate_unique_indices(data=unlabeled_data, name="unlabeled_data")
-            train_features = [column for column in train_data.columns if column != self.label]
-            unlabeled_features = [column for column in unlabeled_data.columns]
-            train_features, unlabeled_features = self._prune_data_features(train_features=train_features, other_features=unlabeled_features, is_labeled=False)
-            train_features = sorted(np.array(train_features))
-            unlabeled_features = sorted(np.array(unlabeled_features))
-            if np.any(train_features != unlabeled_features):
-                raise ValueError(
-                    "Column names must match between training and unlabeled data.\n" "Unlabeled data must have not the label column specified in it.\n"
-                )
-        return train_data, tuning_data, unlabeled_data
+    def _initialize_learning_curve_params(self, learning_curves: dict | bool | None = None, problem_type: str = "") -> dict:
+        """
+        Convert users learning_curve dict parameters into ag_param format.
+        Also, converts all metrics into list of autogluon Scorer objects.
+
+        Parameters:
+        -----------
+        learning_curves : bool | dict | None
+            If bool, whether to generate learning curves.
+            If dict, the dictionary of learning_curves parameters passed into predictor from the user. 
+            If None, will not generate curves.
+        problem_type : str
+            The current problem type.
+
+        Returns:
+        --------
+        params : dict
+            The learning curves parameters in ag_params format.
+        """
+        if learning_curves is None or learning_curves == False:
+            return {}
+        elif type(learning_curves) != dict and type(learning_curves) != bool:
+            raise ValueError("VALUE ERROR: learning curves parameter must be a boolean or dict!")
+
+        # metrics defaults to self.eval_metric if not specified
+        metrics = None
+        use_error = False
+
+        def make_scorer(name):
+            return get_metric(name, problem_type, "eval_metric")
+
+        if type(learning_curves) == dict:
+            if "metrics" in learning_curves:
+                if isinstance(learning_curves["metrics"], str):
+                    metrics = [make_scorer(learning_curves["metrics"])]
+                elif isinstance(learning_curves["metrics"], Scorer):
+                    metrics = [learning_curves["metrics"]]
+                elif isinstance(learning_curves["metrics"], list):
+                    names, scorers = [], []
+                    for metric in learning_curves["metrics"]:
+                        if isinstance(metric, str):
+                            names.append(metric)
+                        elif isinstance(metric, Scorer):
+                            scorers.append(metric)
+
+                    # remove duplicate metrics / aliases
+                    names = list(set([make_scorer(name).name for name in names]))
+                    names = [make_scorer(name) for name in names]
+                    metrics = names + scorers
+
+            if "use_error" in learning_curves:
+                use_error = learning_curves["use_error"]
+
+        params = {
+            "ag.generate_curves": True,
+            "ag.use_error_for_curve_metrics": use_error,
+        }
+
+        if metrics:
+            params["ag.curve_metrics"] = metrics
+
+        return params
 
     @staticmethod
     def _validate_unique_indices(data: pd.DataFrame, name: str):
